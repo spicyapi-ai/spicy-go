@@ -1,13 +1,15 @@
 // Package spicy is the official SpicyAPI client for Go.
 //
-// SpicyAPI serves image and video generation models behind one API. This package
-// covers the asynchronous media workflow end to end: discover a model and its
-// input schema, upload local reference material, quote a request, submit it, wait
-// for a terminal state, and collect the result.
+// SpicyAPI serves image, video and audio generation models behind one API. This
+// package covers the asynchronous media workflow end to end: discover a model and
+// its input schema, upload local reference material, quote a request, submit it,
+// wait for a terminal state, and collect the result.
 //
 // Text models are deliberately out of scope. They speak the OpenAI, Anthropic and
 // Gemini wire formats, so the established clients for those already work against
-// this service; wrapping them here would add nothing.
+// this service; wrapping them here would add nothing. The one piece of this package
+// they do need is Upload: a chat model that reads images, video or audio takes the
+// spicy://f/ URI it returns in an image_url, video_url or audio_url message part.
 //
 // It depends on the standard library only.
 //
@@ -61,7 +63,7 @@ import (
 // enforces that from inside the package: there is no build metadata to read
 // back, because a tagged module exposes its version only to the programs that
 // depend on it, and never to itself.
-const Version = "0.1.2"
+const Version = "0.2.0"
 
 // UserAgent identifies this client on every API request.
 //
@@ -150,6 +152,10 @@ const (
 //	       combination of settings right now. Not retryable: change the
 //	       parameter named in the message, or pick another model. Waiting
 //	       does not help, and nothing was created or held.
+//	40310  the account has not verified its email address yet, so its keys
+//	       cannot run models. Not retryable from code: open the verification
+//	       link sent at sign-up, or send a new one from the Console. The same
+//	       key works as soon as the address is verified.
 //	40901  the quote expired, or the request or price changed since it was
 //	       signed. Quote again, then resubmit.
 //	503    a supporting dependency is briefly unavailable. Retryable; honour
@@ -171,6 +177,7 @@ const (
 	CodeUnsupportedCombination = 40004
 	CodeInsufficientBalance    = 40201
 	CodeSpendCapReached        = 40202
+	CodeEmailNotVerified       = 40310
 	CodeQuoteRejected          = 40901
 	CodeDependencyUnavailable  = 503
 	CodeModelUnavailable       = 50301
@@ -276,7 +283,10 @@ type ModelPrice struct {
 	// Variant identifies the tier, for example "720p" or
 	// "duration=5;resolution=720p". Empty when the model has a single price.
 	Variant string `json:"variant"`
-	// Unit is per_image, per_second, per_request or per_1k_tokens.
+	// Unit is per_image, per_second, per_request, per_1k_tokens or
+	// per_1k_characters (text-to-speech priced on the length of the script).
+	// Treat it as open: a unit added later must not break a client that only
+	// displays it.
 	Unit string `json:"unit"`
 	// Price is a decimal USD string. Keep it a string end to end; binary
 	// floating point cannot hold these amounts exactly.
@@ -310,13 +320,20 @@ type Model struct {
 	Modality string `json:"modality"`
 	// Tasks holds exactly one internal classification and is not always the
 	// suffix of Model: editing endpoints publish as .../edit and classify as
-	// image-to-image. Call with Model; group with Tasks.
+	// image-to-image, or as image-edit for single-purpose tools such as
+	// background removal. Call with Model; group with Tasks. The set is open
+	// and grows as models are added.
 	Tasks []string `json:"tasks"`
 	Async bool     `json:"async"`
 	// Mature and PolicyTier are informational metadata about the model. They
 	// take no part in authorization, availability or rejection.
 	Mature     bool   `json:"mature"`
 	PolicyTier string `json:"policyTier"`
+	// Toolkit groups related endpoints for display: subject-swap for identity
+	// swaps, studio-tools for single-purpose image and video tools such as
+	// upscaling. Empty when the model belongs to no toolkit. It takes no part
+	// in routing, pricing or authorization, and the set is open.
+	Toolkit string `json:"toolkit,omitempty"`
 	// TaskTimeoutSeconds is the platform execution deadline, not the duration
 	// of the media that comes out.
 	TaskTimeoutSeconds int `json:"taskTimeoutSeconds"`
@@ -370,6 +387,8 @@ type CreateTaskInput struct {
 	Model string `json:"model"`
 	// Input is validated against that model's input schema. Media fields take
 	// a public HTTPS URL, a committed spicy:// URI, or a small Base64 data URI.
+	// Image fields also take a persona image created in the Console, as
+	// spicy://p/<assetId>, from keys created in your personal workspace.
 	Input map[string]any `json:"input"`
 	// CallBackURL is an optional public HTTPS endpoint for terminal delivery.
 	// Verify every delivery with VerifyWebhook before acting on it.
@@ -448,6 +467,25 @@ type Asset struct {
 	Pending bool `json:"pending,omitempty"`
 	// Unavailable means it will not arrive; do not keep waiting for it.
 	Unavailable bool `json:"unavailable,omitempty"`
+	// Layer is set only on the outputs of a layer-decomposition task.
+	Layer *AssetLayer `json:"layer,omitempty"`
+}
+
+// AssetLayer places one output of a layer-decomposition task.
+//
+// The first asset is the base image (the source with the separated elements
+// removed, ZIndex 0) and every other asset is one transparent PNG layer. Stack
+// them by ascending ZIndex to rebuild the picture, rather than relying on the
+// order of Assets.
+type AssetLayer struct {
+	ZIndex int `json:"zIndex"`
+	// Name is the model's own label for the layer, when it gives one.
+	Name string `json:"name,omitempty"`
+	// BoundingBox is [x1, y1, x2, y2] in base-image pixels: scale the layer
+	// into that box to put it back in place. It is nil on the base image and on
+	// models that do not report positions, where the layers still work as
+	// standalone cut-outs.
+	BoundingBox []int `json:"boundingBox,omitempty"`
 }
 
 // TaskOutput is the result payload of a finished task.
@@ -456,8 +494,55 @@ type Asset struct {
 // answer in Text and return no assets at all, so check what you actually got
 // before reaching for Assets[0].
 type TaskOutput struct {
-	Text   string  `json:"text,omitempty"`
-	Assets []Asset `json:"assets,omitempty"`
+	// Text is the plain-text result. For a multichannel transcription it holds
+	// one line per channel, in channel order.
+	Text string `json:"text,omitempty"`
+	// Transcript is the structured speech-to-text result, with timing and
+	// language details. Nil on every other task, and on transcription models
+	// that return plain text only.
+	Transcript *TaskTranscript `json:"transcript,omitempty"`
+	Assets     []Asset         `json:"assets,omitempty"`
+}
+
+// TaskTranscript is a structured transcription. It is erased together with the
+// rest of the output on the prompt-retention schedule.
+type TaskTranscript struct {
+	Text string `json:"text,omitempty"`
+	// Language is the detected language as the model reports it, for example
+	// "en"; LanguageCode is the ISO 639-3 form, for example "eng", when known.
+	Language     string `json:"language,omitempty"`
+	LanguageCode string `json:"languageCode,omitempty"`
+	// LanguageProbability is the confidence of that detection, 0 to 1. It is a
+	// pointer because "not reported" and "zero confidence" are different.
+	LanguageProbability *float64 `json:"languageProbability,omitempty"`
+	// DurationSeconds is the length of the transcribed audio.
+	DurationSeconds float64              `json:"durationSeconds,omitempty"`
+	Words           []TaskTranscriptWord `json:"words,omitempty"`
+	// Channels has one entry per audio channel when multichannel
+	// transcription was requested, and is empty otherwise.
+	Channels []TaskTranscriptChannel `json:"channels,omitempty"`
+}
+
+// TaskTranscriptWord is one timed segment of a transcript. Start and End are
+// seconds from the beginning of the audio.
+type TaskTranscriptWord struct {
+	Text  string  `json:"text"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+	// Type is the segment type, for example "word", when the model reports one.
+	Type string `json:"type,omitempty"`
+	// SpeakerID is present only when the model separates speakers.
+	SpeakerID string `json:"speakerId,omitempty"`
+}
+
+// TaskTranscriptChannel is the transcript of one audio channel.
+type TaskTranscriptChannel struct {
+	// Index is zero-based.
+	Index        int                  `json:"index"`
+	Text         string               `json:"text,omitempty"`
+	Language     string               `json:"language,omitempty"`
+	LanguageCode string               `json:"languageCode,omitempty"`
+	Words        []TaskTranscriptWord `json:"words,omitempty"`
 }
 
 // TaskRetention says when this task's content disappears and which layer
@@ -487,6 +572,12 @@ type Task struct {
 	ErrorMessage string `json:"errorMessage,omitempty"`
 	// Cost is a decimal USD string: the final charge once Settled is true, and
 	// the held estimate before that.
+	//
+	// A failed or expired task normally releases its hold in full, with one
+	// exception: on a model
+	// whose page states that content-policy refusals are billed, a task that
+	// fails with ErrorCodeContentRejected settles at the accepted estimate.
+	// Read Cost once Settled is true instead of assuming a failure was free.
 	Cost    string `json:"cost"`
 	Settled bool   `json:"settled"`
 
@@ -711,8 +802,10 @@ type ListModelsOptions struct {
 	Modality string
 	// Provider is the model's creator.
 	Provider string
-	// Task is an exact task, for example text-to-image. Image editing accepts
-	// either spelling: edit and image-to-image select the same endpoints.
+	// Task is an exact task, for example text-to-image or text-to-speech.
+	// "edit" is the one alias: it selects every endpoint published with the
+	// .../edit suffix, which covers both image-to-image and the single-purpose
+	// image-edit tools, while "image-to-image" selects only the former.
 	Task string
 	// Search matches names and descriptions.
 	Search string
@@ -1173,8 +1266,13 @@ func (c *Client) PurgeTask(ctx context.Context, taskID string) (*PurgeResult, er
 // selected task back with GetTask when you need any of that.
 type TaskListItem struct {
 	TaskID string `json:"taskId"`
-	Model  string `json:"model"`
-	State  string `json:"state"`
+	// RequestID is the X-Request-Id of the request that created the task, so a
+	// synchronous text call made through the OpenAI, Anthropic or Gemini
+	// compatible endpoints can be matched to its charge here. Empty when none
+	// was recorded.
+	RequestID string `json:"requestId,omitempty"`
+	Model     string `json:"model"`
+	State     string `json:"state"`
 	// Cost is the final charged amount once Settled is true, and the current
 	// held estimate before that. A decimal USD string, so an unsettled row is
 	// a ceiling rather than a bill.
@@ -1305,6 +1403,12 @@ func (c *Client) EachTask(ctx context.Context, opts ListTasksOptions, fn func(Ta
 }
 
 // uploadContentTypes maps an extension to one of the accepted media types.
+//
+// ".key" is left out on purpose although Keynote is accepted. It is also the
+// usual extension of a PEM private key, and inferring a type from it would
+// stream that key's bytes into object storage before the server's commit check
+// got the chance to refuse them. Pass the content type explicitly to upload a
+// Keynote file.
 var uploadContentTypes = map[string]string{
 	".gif":  "image/gif",
 	".jpeg": "image/jpeg",
@@ -1315,11 +1419,24 @@ var uploadContentTypes = map[string]string{
 	".webm": "video/webm",
 	".mp3":  "audio/mpeg",
 	".wav":  "audio/wav",
+
+	".pdf":     "application/pdf",
+	".doc":     "application/msword",
+	".docx":    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".xls":     "application/vnd.ms-excel",
+	".xlsx":    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".ppt":     "application/vnd.ms-powerpoint",
+	".pptx":    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".pages":   "application/vnd.apple.pages",
+	".numbers": "application/vnd.apple.numbers",
+	".txt":     "text/plain",
+	".md":      "text/markdown",
 }
 
 // CreateUploadURL asks for a presigned slot for exactly one file of exactly
 // the declared size. Images are capped at 10 MiB, audio and video at 90 MiB
-// and 600 seconds; the ticket's MaxBytes is the authoritative ceiling.
+// and 600 seconds, reference documents (PDF, Office, iWork, plain text and
+// Markdown) at 90 MiB; the ticket's MaxBytes is the authoritative ceiling.
 //
 // The ticket lives about twenty minutes and that window covers both the PUT
 // and the commit, so ask for it right before uploading rather than in advance.
@@ -2068,9 +2185,22 @@ func isLoopback(host string) bool {
 }
 
 // acceptedUploadTypes is the closed set the upload ticket endpoint takes.
+// TestContractHasNotDrifted pins it to the published contract.
 var acceptedUploadTypes = []string{
 	"image/jpeg", "image/png", "image/webp", "image/gif",
 	"video/mp4", "video/webm", "audio/mpeg", "audio/wav",
+	"application/pdf",
+	"application/msword",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"application/vnd.ms-excel",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"application/vnd.ms-powerpoint",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	"application/vnd.apple.keynote",
+	"application/vnd.apple.pages",
+	"application/vnd.apple.numbers",
+	"text/plain",
+	"text/markdown",
 }
 
 func isAcceptedUploadType(contentType string) bool {

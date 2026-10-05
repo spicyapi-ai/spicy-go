@@ -2,7 +2,7 @@
 
 # spicy-go
 
-**Official Go SDK for [SpicyAPI](https://spicyapi.ai)** — image, video and text models behind one API.
+**Official Go SDK for [SpicyAPI](https://spicyapi.ai)** — image, video, audio and text models behind one API.
 
 [Get a key](https://spicyapi.ai) · [Models](https://spicyapi.ai/models) · [Docs](https://docs.spicyapi.ai) · [Status](https://status.spicyapi.ai)
 
@@ -10,7 +10,7 @@
 
 ---
 
-One endpoint in front of 83 model families across 121 callable endpoints, billed in USD per request
+One endpoint in front of 142 model families across 214 callable endpoints, billed in USD per request
 rather than in credits. Media generation is asynchronous and quotable before you spend; text models
 speak the OpenAI, Anthropic and Gemini wire formats.
 
@@ -113,6 +113,11 @@ uploaded, err := client.UploadFile(ctx, "/path/to/reference.png", "")
 // uploaded.URI -> "spicy://f/fil_..."
 ```
 
+Images, MP4/WebM video, MP3/WAV audio and reference documents (PDF, Word, Excel, PowerPoint,
+Pages, Numbers, plain text, Markdown) are accepted. The content type is inferred from the extension,
+except for Keynote: `.key` is also how private keys are named, so pass
+`"application/vnd.apple.keynote"` yourself rather than have a key file uploaded on a guess.
+
 ## Balance, usage and history
 
 All three are scoped to **this API key**: sibling keys on the same account, and
@@ -172,6 +177,7 @@ shared by three different business codes**, so the status alone is not enough to
 | --- | --- | --- |
 | `40003` | uploaded bytes do not match their ticket | upload again |
 | `40004` | no deployment serves that parameter combination | change the named parameter |
+| `40310` | the account's email address is not verified yet | open the verification link; the same key then works |
 | `40901` | the price moved before the task was created | quote again, keep the same idempotency key |
 | `503` | a dependency is briefly unavailable | back off by `RetryAfter` |
 | `50301` | no usable deployment or price right now | refresh the catalogue, do not hammer |
@@ -184,12 +190,18 @@ A lost response does not prove the task was not created — a fresh key turns an
 a second paid task. `CreateTask` requires the key for exactly this reason.
 
 **A task that succeeds is charged, even if the result disappoints.** `Quote` reserves nothing, so
-quote first when the price matters.
+quote first when the price matters. Failures are normally free, with one exception: on a model whose
+page says content-policy refusals are billed, a task that fails with `content_rejected` settles at
+the estimate it was accepted at. Read `Cost` once `Settled` is true rather than assuming.
 
 ## What this package does not do
 
 **Text models.** They speak the OpenAI, Anthropic and Gemini wire formats — the established Go
-clients for those already work against `https://api.spicyapi.ai/v1` with the same key.
+clients for those already work against `https://api.spicyapi.ai/v1` with the same key. One part of
+this package still helps there: chat models that read images, video or audio take the `spicy://f/`
+URI from `UploadFile` in an `image_url`, `video_url` or `audio_url` message part. Which parts a
+model accepts is in its input schema; see
+[sending media to a text model](https://docs.spicyapi.ai/docs/text-and-streaming#media-input).
 
 **Client-side applications.** Never ship this key inside a binary you distribute. Call from your
 server.

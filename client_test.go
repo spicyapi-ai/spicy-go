@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1097,5 +1099,212 @@ func TestWaitKeepsTaskNilWhenA200CarriesAnInFlightRecord(t *testing.T) {
 	}
 	if !result.InFlight() {
 		t.Error("InFlight() must still report the task as running")
+	}
+}
+
+// -- Contract additions of 2026-10: documents, transcripts, layers ----------
+
+// TestTaskRecordDecodesTranscriptAndLayers pins the two result shapes that arrived with
+// speech-to-text and layer decomposition. Without typed fields they decode into nothing at all -
+// encoding/json drops unknown keys without a word - so the caller sees an empty transcript and a
+// pile of PNGs with no way to put them back together.
+func TestTaskRecordDecodesTranscriptAndLayers(t *testing.T) {
+	api := newRecordingAPI(t,
+		`{"code":200,"msg":"success","request_id":"r","data":{
+			"taskId":"task_stt","model":"m","state":"succeeded","cost":"0.0100","settled":true,
+			"createdAt":"2026-10-05T10:00:00Z",
+			"output":{"text":"left\nright","transcript":{
+				"text":"left right","language":"en","languageCode":"eng",
+				"languageProbability":0.98,"durationSeconds":4.2,
+				"words":[{"text":"left","start":0.1,"end":0.4,"type":"word","speakerId":"speaker_0"}],
+				"channels":[{"index":0,"text":"left","words":[{"text":"left","start":0.1,"end":0.4}]},
+					{"index":1,"text":"right"}]}}}}`,
+		`{"code":200,"msg":"success","request_id":"r","data":{
+			"taskId":"task_layers","model":"m","state":"succeeded","cost":"0.0300","settled":true,
+			"createdAt":"2026-10-05T10:00:00Z",
+			"output":{"assets":[
+				{"key":"base","url":"https://cdn.example/base.png","mime":"image/png","layer":{"zIndex":0}},
+				{"key":"l1","url":"https://cdn.example/l1.png","mime":"image/png",
+					"layer":{"zIndex":2,"name":"hat","boundingBox":[10,20,110,220]}}]}}}`,
+		`{"code":200,"msg":"success","request_id":"r","data":{
+			"taskId":"task_plain","model":"m","state":"succeeded","cost":"0.0100","settled":true,
+			"createdAt":"2026-10-05T10:00:00Z",
+			"output":{"assets":[{"key":"a","url":"https://cdn.example/a.mp3","mime":"audio/mpeg",
+				"durationSeconds":3.5}]}}}`)
+	client := api.client(t)
+
+	stt, err := client.GetTask(context.Background(), "task_stt")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	transcript := stt.Output.Transcript
+	if transcript == nil {
+		t.Fatal("the structured transcript was dropped")
+	}
+	if transcript.Text != "left right" || transcript.LanguageCode != "eng" || transcript.DurationSeconds != 4.2 {
+		t.Errorf("transcript = %+v", transcript)
+	}
+	if transcript.LanguageProbability == nil || *transcript.LanguageProbability != 0.98 {
+		t.Errorf("languageProbability = %v, want 0.98", transcript.LanguageProbability)
+	}
+	if len(transcript.Words) != 1 || transcript.Words[0].SpeakerID != "speaker_0" || transcript.Words[0].End != 0.4 {
+		t.Errorf("words = %+v", transcript.Words)
+	}
+	if len(transcript.Channels) != 2 || transcript.Channels[1].Index != 1 || len(transcript.Channels[0].Words) != 1 {
+		t.Errorf("channels = %+v", transcript.Channels)
+	}
+	// The plain text stays where it always was; the structured result is an addition, not a move.
+	if stt.Output.Text != "left\nright" {
+		t.Errorf("text = %q", stt.Output.Text)
+	}
+
+	layers, err := client.GetTask(context.Background(), "task_layers")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	assets := layers.Output.Assets
+	if len(assets) != 2 {
+		t.Fatalf("assets = %+v", assets)
+	}
+	// The base image has zIndex 0. It must still decode to a non-nil Layer: nil is how a caller
+	// tells "not a decomposition result" apart from "the bottom of the stack".
+	if assets[0].Layer == nil || assets[0].Layer.ZIndex != 0 || assets[0].Layer.BoundingBox != nil {
+		t.Errorf("base layer = %+v", assets[0].Layer)
+	}
+	if got := assets[1].Layer; got == nil || got.ZIndex != 2 || got.Name != "hat" ||
+		len(got.BoundingBox) != 4 || got.BoundingBox[3] != 220 {
+		t.Errorf("layer = %+v", got)
+	}
+
+	// The counter-case: an ordinary output carries neither, so neither may appear out of nowhere.
+	plain, err := client.GetTask(context.Background(), "task_plain")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if plain.Output.Transcript != nil || plain.Output.Assets[0].Layer != nil {
+		t.Errorf("an ordinary audio result grew a transcript or a layer: %+v", plain.Output)
+	}
+}
+
+// TestListTasksCarriesTheRequestID pins the field that ties a synchronous text call - made with
+// an OpenAI, Anthropic or Gemini client, not with this package - back to the task that holds its
+// charge.
+func TestListTasksCarriesTheRequestID(t *testing.T) {
+	api := newRecordingAPI(t, `{"code":200,"msg":"success","request_id":"r","data":{
+		"items":[{"taskId":"job_1","requestId":"req_abc","model":"m","state":"succeeded",
+			"cost":"0.0010","settled":true,"createdAt":"2026-10-05T10:00:00Z",
+			"deadlineAt":"2026-10-05T10:05:00Z"},
+			{"taskId":"job_2","model":"m","state":"succeeded","cost":"0.0010","settled":true,
+			"createdAt":"2026-10-05T10:00:00Z","deadlineAt":"2026-10-05T10:05:00Z"}],
+		"hasMore":false}}`)
+
+	list, err := api.client(t).ListTasks(context.Background(), ListTasksOptions{})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	if len(list.Items) != 2 || list.Items[0].RequestID != "req_abc" || list.Items[1].RequestID != "" {
+		t.Errorf("items = %+v", list.Items)
+	}
+}
+
+// TestGetModelReadsTheToolkit pins the grouping field that the studio tools are listed under.
+func TestGetModelReadsTheToolkit(t *testing.T) {
+	api := newRecordingAPI(t, `{"code":200,"msg":"success","request_id":"r","data":{
+		"model":"spicyapi/background-remover-v1/edit","family":"background-remover/v1",
+		"modality":"image","tasks":["image-edit"],"toolkit":"studio-tools",
+		"pricing":[{"variant":"","unit":"per_image","price":"0.0100","currency":"USD"}]}}`)
+
+	model, err := api.client(t).GetModel(context.Background(), "spicyapi/background-remover-v1/edit")
+	if err != nil {
+		t.Fatalf("GetModel: %v", err)
+	}
+	if model.Toolkit != "studio-tools" || len(model.Tasks) != 1 || model.Tasks[0] != "image-edit" {
+		t.Errorf("model = %+v", model)
+	}
+}
+
+// uploadIntakeAPI answers the first upload-url call with a business failure, after recording its
+// body. That is enough to see which content type the client asked for without a storage server.
+func uploadIntakeAPI(t *testing.T) (*Client, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, r.Method+" "+r.URL.Path+" "+string(raw))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":400,"msg":"stop here","request_id":"r","data":null}`))
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Options{APIKey: "sk-test", BaseURL: server.URL, MaxRetries: -1})
+	if err != nil {
+		t.Fatalf("build a client: %v", err)
+	}
+	return client, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), bodies...)
+	}
+}
+
+// TestUploadFileInfersDocumentTypes pins that reference documents get past the local type check.
+// Before the contract added them, a PDF headed for a reference-file model was refused here, by
+// this package, with an error that read as though the platform did not take documents at all.
+func TestUploadFileInfersDocumentTypes(t *testing.T) {
+	cases := map[string]string{
+		"brief.PDF":  "application/pdf",
+		"deck.pptx":  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		"notes.md":   "text/markdown",
+		"sheet.xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	}
+	for name, want := range cases {
+		t.Run(name, func(t *testing.T) {
+			client, seen := uploadIntakeAPI(t)
+			path := filepath.Join(t.TempDir(), name)
+			if err := os.WriteFile(path, []byte("document bytes"), 0o600); err != nil {
+				t.Fatalf("write %s: %v", path, err)
+			}
+
+			_, err := client.UploadFile(context.Background(), path, "")
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Code != 400 {
+				t.Fatalf("expected the fake API's own rejection, got %v", err)
+			}
+			got := seen()
+			if len(got) != 1 || !strings.HasPrefix(got[0], "POST /common/upload-url ") ||
+				!strings.Contains(got[0], `"contentType":"`+want+`"`) {
+				t.Errorf("requests = %v, want one upload-url call for %s", got, want)
+			}
+		})
+	}
+}
+
+// TestUploadFileDoesNotGuessKeynoteFromDotKey pins the one extension left out of inference.
+// ".key" is how PEM private keys are usually named; guessing Keynote from it would stream a key
+// into object storage, and the server can only refuse the bytes after they have arrived.
+func TestUploadFileDoesNotGuessKeynoteFromDotKey(t *testing.T) {
+	client, seen := uploadIntakeAPI(t)
+	path := filepath.Join(t.TempDir(), "server.key")
+	if err := os.WriteFile(path, []byte("-----BEGIN PRIVATE KEY-----\nnot real\n"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+
+	if _, err := client.UploadFile(context.Background(), path, ""); err == nil ||
+		!strings.Contains(err.Error(), "cannot infer a content type") {
+		t.Errorf("a .key file must not be uploaded on a guess, got %v", err)
+	}
+	if got := seen(); len(got) != 0 {
+		t.Errorf("a .key file reached the API without an explicit content type: %v", got)
+	}
+
+	// The counter-case: Keynote itself is accepted once the caller says so, so the exclusion is
+	// about guessing, not about the format.
+	if _, err := client.UploadFile(context.Background(), path, "application/vnd.apple.keynote"); err == nil {
+		t.Fatal("expected the fake API's own rejection")
+	}
+	if got := seen(); len(got) != 1 || !strings.Contains(got[0], `"contentType":"application/vnd.apple.keynote"`) {
+		t.Errorf("an explicit Keynote upload did not reach the API: %v", got)
 	}
 }
