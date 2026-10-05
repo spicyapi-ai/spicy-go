@@ -95,7 +95,7 @@ import (
 	"errors"
 	"log"
 
-	spicy "github.com/Spicy-API/spicy-go"
+	spicy "github.com/spicyapi-ai/spicy-go"
 )
 
 // Imports a snippet does not use are consumed here: otherwise "imported and not used" would
@@ -170,8 +170,8 @@ func compileSnippet(t *testing.T, root, prelude, block, sink string) {
 		}
 	}
 	write("go.mod", "module spicyreadmecheck\n\ngo 1.23\n\n"+
-		"require github.com/Spicy-API/spicy-go v0.0.0\n\n"+
-		"replace github.com/Spicy-API/spicy-go => "+root+"\n")
+		"require github.com/spicyapi-ai/spicy-go v0.0.0\n\n"+
+		"replace github.com/spicyapi-ai/spicy-go => "+root+"\n")
 	write("main.go", sprintfHarness(indent(prelude), indent(block), indent(sink)))
 
 	build := exec.Command("go", "build", "./...")
