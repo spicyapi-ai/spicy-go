@@ -18,6 +18,8 @@ speak the OpenAI, Anthropic and Gemini wire formats.
 go get github.com/spicyapi-ai/spicy-go
 ```
 
+This README describes v0.3.0; see the [changelog](CHANGELOG.md) for what changed.
+
 Requires Go 1.23+. **Standard library only** — this package goes into your dependency graph, and
 every module it adds is one more thing for you to audit.
 
@@ -114,9 +116,138 @@ uploaded, err := client.UploadFile(ctx, "/path/to/reference.png", "")
 ```
 
 Images, MP4/WebM video, MP3/WAV audio and reference documents (PDF, Word, Excel, PowerPoint,
-Pages, Numbers, plain text, Markdown) are accepted. The content type is inferred from the extension,
-except for Keynote: `.key` is also how private keys are named, so pass
-`"application/vnd.apple.keynote"` yourself rather than have a key file uploaded on a guess.
+Pages, Numbers, plain text, Markdown) are accepted, and so are LoRA weights: a `.safetensors` file,
+sent as `application/octet-stream` and up to 2 GiB, whose URI goes into `loras[].path`. The file is
+streamed from disk, but a file that large can outlast the default ten-minute upload timeout, so
+raise `Options.UploadTimeout` for big ones.
+
+The content type is inferred from the extension, except for Keynote: `.key` is also how private
+keys are named, so pass `"application/vnd.apple.keynote"` yourself rather than have a key file
+uploaded on a guess.
+
+An upload's URI lasts one day. To keep a file, save it to the asset library.
+
+## Asset library
+
+Files you use again and again — a character portrait, a style reference, a voice sample — belong in
+your asset library: each saved file gets a stable `URI` of the form `spicy://a/<id>` that works in
+any media field of model inputs sent with keys of the same workspace, until it is deleted. The
+library never hands out a public or permanent link.
+
+The key decides the library. A key created in your personal workspace reaches your personal library;
+a key created in a team workspace, by any member, reaches that team's shared library and never
+anyone's personal one. With a team key, what may change follows the current role of the member who
+created it: owner and admin can save, rename, favorite and delete anything; developer can save, and
+rename, favorite or delete what they saved; billing and readonly can only read and use assets.
+
+```go
+// Save the first output of one of your successful tasks (with a team key, one of the team's).
+// AssetSourceURL with URL, and AssetSourceUpload with FileID, work the same way. The required
+// Idempotency-Key is minted for you; pass your own as the last argument to replay a save.
+index := 0
+hero, err := client.SaveAsset(ctx, spicy.SaveAssetInput{
+    Source: spicy.AssetSourceTaskOutput,
+    TaskID: "job_...",
+    Index:  &index,
+    Name:   "Hero portrait",
+}, "")
+if err != nil {
+    return err
+}
+
+// Or upload a local file and save it in one call; the name defaults to the file name.
+voice, err := client.UploadAssetFile(ctx, "./voice-sample.wav", spicy.UploadAssetOptions{})
+if err != nil {
+    return err
+}
+log.Println(voice.URI)
+
+// Later, in any request: the URI goes where the model's schema expects a file.
+input := map[string]any{"prompt": "Slow push-in, light rain", "image_url": hero.URI}
+
+// Every saved image, newest first, across all pages.
+err = client.EachAsset(ctx, spicy.ListAssetsOptions{Kind: "image", Q: "portrait"},
+    func(asset spicy.LibraryAsset) bool {
+        log.Println(asset.URI, asset.Name, asset.Bytes)
+        return true // return false to stop early
+    })
+if err != nil {
+    return err
+}
+```
+
+| Method | Returns |
+| --- | --- |
+| `SaveAsset(ctx, SaveAssetInput{...}, idempotencyKey)` | The saved `*LibraryAsset`: `ID`, `URI`, `Name`, `Kind`, `Bytes`, `Favorite`, `Model`, `PreviewURL`, … |
+| `UploadAssetFile(ctx, path, UploadAssetOptions{Name, ContentType})` | Uploads with `UploadFile`, then saves; the saved asset |
+| `ListAssets(ctx, ListAssetsOptions{...})` | One page: `Items`, `NextCursor` (empty on the last page) |
+| `EachAsset(ctx, ListAssetsOptions{...}, fn)` | Calls `fn` for every matching asset, page by page |
+| `GetAsset(ctx, assetID)` | One asset with a fresh `PreviewURL` |
+| `UpdateAsset(ctx, assetID, UpdateAssetInput{Name, Favorite})` | The updated asset; only what you set changes, the `URI` stays the same |
+| `DeleteAsset(ctx, assetID)` | `*DeletedAsset`; the `URI` stops working at once |
+| `GetAssetUsage(ctx)` | `Scope` (which library, role, `CanWrite`, `CanTopUp`), plan, usage and limits |
+| `ListCharacters(ctx, ListCharactersOptions{AssetID, Cursor, Limit})` / `EachCharacter(...)` | Characters, newest first, each with its images in order |
+| `GetCharacter(ctx, characterID)` | One character with its images in order; `URIs()` lists their references |
+
+- `assetID` may be the bare `ast_…` ID or the `spicy://a/…` reference. An empty ID, a blank filter,
+  an unknown `Sort` and a save that mixes two sources fail before anything is sent.
+- `Source` takes several values (`AssetSourceTaskOutput`, `AssetSourceUpload`, `AssetSourceURL`).
+  `Favorite` is a `*bool`: `true` lists only favorites, `false` only the rest, `nil` both.
+- `Sort` is `AssetSortRecent` (the default, newest first), `AssetSortOldest`, `AssetSortName` or
+  `AssetSortSize`. A `NextCursor` only works with the `Sort` it came from; sending it with another
+  one fails with `400`, which is returned as-is and not retried. `EachAsset` keeps your filters and
+  `Sort` on every page.
+- Saving the same task output, upload or URL again returns the asset you already have. Pass your
+  own idempotency key to replay a save safely after an uncertain response, for example across a
+  restart.
+- `PreviewURL` is a private preview signed for at most 20 minutes. Show it; store `URI`.
+- Storage unlocks with the owner's lifetime top-ups, and the owner's personal and team libraries
+  share one allowance. `GetAssetUsage` reports the whole allowance; with a team key whose creator is
+  not the owner, `Scope.CanTopUp` is false and `LifetimeTopupUSD` and `TopupToNextTierUSD` are
+  empty.
+- A refused call returns `*spicy.APIError` with a `Reason`: `ReasonAssetLibraryLocked`,
+  `ReasonAssetLibraryFull` and `ReasonAssetFileTooLarge` (400, plan limits — read `GetAssetUsage`
+  for the numbers), `ReasonAssetDailyLimit` (429, resets at 00:00 UTC, with `RetryAfter`),
+  `ReasonAssetStorageFull` (503, temporary), `ReasonAssetPermissionDenied` (403, the team role does
+  not allow this change), `ReasonAssetWorkspaceForbidden` (403, this key cannot reach that library,
+  for example because its creator left the team) and `ReasonAssetEntityNameTaken` (409, a character
+  with that name already exists). `IsAssetErrorReason` tells them apart; `Reason` carries any other
+  value the server sends unchanged, so keep a default branch.
+
+### Favorites, folders and characters
+
+Every asset has a `Favorite` flag; in a team library everyone sees the same favorites. Folders
+(collections in the API) and characters are created and arranged on the Assets page of the web app;
+the API reads them. Each asset also carries `Model` and `ModelName`, the model that generated it
+(empty for uploads and links).
+
+```go
+// Mark a favorite, then list only favorites in one folder, A to Z.
+favorite := true
+if _, err := client.UpdateAsset(ctx, hero.URI, spicy.UpdateAssetInput{Favorite: &favorite}); err != nil {
+    return err
+}
+page, err := client.ListAssets(ctx, spicy.ListAssetsOptions{
+    Favorite:     &favorite,
+    CollectionID: "col_...",
+    Sort:         spicy.AssetSortName,
+})
+if err != nil {
+    return err
+}
+
+// A character is a named, ordered set of images. Put its images, in order, into the model's
+// reference image field (GetModel shows which field takes a list of images).
+mia, err := client.GetCharacter(ctx, "ety_...")
+if err != nil {
+    return err
+}
+references := mia.URIs() // ["spicy://a/ast_...", ...]
+```
+
+An unknown folder, and an unknown character, both fail with `404`. Characters used to be called
+personas: existing `spicy://p/<id>` references keep resolving to the same images, in your personal
+library only; new code should use the `spicy://a/` references a character lists.
 
 ## Balance, usage and history
 
@@ -166,11 +297,14 @@ Failures come back as `*spicy.APIError`, reachable with `errors.As`:
 ```go
 var apiErr *spicy.APIError
 if errors.As(err, &apiErr) {
-    log.Println(apiErr.Status, apiErr.Code, apiErr.RequestID, apiErr.RetryAfter)
+    log.Println(apiErr.Status, apiErr.Code, apiErr.Reason, apiErr.RequestID, apiErr.RetryAfter)
 }
 ```
 
-Branch on `Code`, never on the message — messages are translated, codes are not. **HTTP 503 is
+Branch on `Code`, or on `Reason` when the server sends one (see [Asset library](#asset-library)),
+never on the message — messages are translated, codes are not. A retryable failure whose
+`RetryAfter` is longer than this client waits between attempts, or than your context has left, is
+returned at once with that `RetryAfter`, rather than slept through into a timeout. **HTTP 503 is
 shared by three different business codes**, so the status alone is not enough to decide what to do:
 
 | Code | Meaning | What to do |

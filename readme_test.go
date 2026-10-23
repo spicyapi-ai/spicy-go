@@ -67,6 +67,17 @@ var readmeSnippets = []readmeSnippet{
 		sink:   "_, _ = uploaded, err",
 	},
 	{
+		name:   "Asset library",
+		anchor: "client.SaveAsset",
+		sink:   "_ = input",
+	},
+	{
+		name:    "Favorites, folders and characters",
+		anchor:  "client.GetCharacter",
+		prelude: "hero := &spicy.LibraryAsset{}\n",
+		sink:    "_, _ = page, references",
+	},
+	{
 		name:   "Balance, usage and history",
 		anchor: "client.EachTask",
 	},

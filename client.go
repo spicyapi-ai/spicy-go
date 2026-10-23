@@ -16,7 +16,9 @@
 // What it covers is the asynchronous generation pipeline: find a model and its
 // input schema, quote it, create a task, poll that task to a terminal state,
 // upload reference media, refresh an expired artefact link, and verify the
-// webhook that announces a result. Text models are reached through the
+// webhook that announces a result. Files worth keeping go into the asset
+// library (SaveAsset), where they get a stable spicy://a/ reference that does
+// not expire. Text models are reached through the
 // OpenAI, Anthropic and Gemini compatible layers instead, where the official
 // libraries work by changing only the base URL.
 //
@@ -63,7 +65,7 @@ import (
 // enforces that from inside the package: there is no build metadata to read
 // back, because a tagged module exposes its version only to the programs that
 // depend on it, and never to itself.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // UserAgent identifies this client on every API request.
 //
@@ -222,12 +224,22 @@ type APIError struct {
 	RequestID string
 	// RetryAfter is the server's own backoff request, 0 when absent.
 	RetryAfter time.Duration
+	// Reason is the failure envelope's data.reason, a stable machine-readable
+	// refinement of Code, and empty when the server sent none. Branch on it
+	// (or on Code), never on Message. The asset library's values are the
+	// Reason* constants; any other value is passed through exactly as
+	// received, so keep a default branch and treat an unknown one like an
+	// empty one.
+	Reason string
 }
 
 func (e *APIError) Error() string {
 	parts := []string{fmt.Sprintf("spicy: %s", e.Message)}
 	if e.Code != 0 {
 		parts = append(parts, fmt.Sprintf("code %d", e.Code))
+	}
+	if e.Reason != "" {
+		parts = append(parts, fmt.Sprintf("reason %s", e.Reason))
 	}
 	if e.Status != 0 {
 		parts = append(parts, fmt.Sprintf("HTTP %d", e.Status))
@@ -1431,15 +1443,22 @@ var uploadContentTypes = map[string]string{
 	".numbers": "application/vnd.apple.numbers",
 	".txt":     "text/plain",
 	".md":      "text/markdown",
+
+	// LoRA weights for loras[].path. The contract names no narrower type for a .safetensors
+	// file, so it travels as application/octet-stream, and commit checks that it is complete.
+	".safetensors": "application/octet-stream",
 }
 
 // CreateUploadURL asks for a presigned slot for exactly one file of exactly
 // the declared size. Images are capped at 10 MiB, audio and video at 90 MiB
 // and 600 seconds, reference documents (PDF, Office, iWork, plain text and
-// Markdown) at 90 MiB; the ticket's MaxBytes is the authoritative ceiling.
+// Markdown) at 90 MiB, and LoRA weights (application/octet-stream, a
+// .safetensors file) at 2 GiB; the ticket's MaxBytes is the authoritative
+// ceiling.
 //
-// The ticket lives about twenty minutes and that window covers both the PUT
-// and the commit, so ask for it right before uploading rather than in advance.
+// The ticket lives about twenty minutes (two hours for LoRA weights) and that
+// window covers both the PUT and the commit, so ask for it right before
+// uploading rather than in advance.
 func (c *Client) CreateUploadURL(ctx context.Context, contentType string, size int64) (*UploadTicket, error) {
 	if !isAcceptedUploadType(contentType) {
 		return nil, fmt.Errorf(
@@ -1489,34 +1508,62 @@ func (c *Client) CommitUpload(ctx context.Context, fileID string) (*UploadedFile
 // object storage, then commit. Only the URI on the returned file belongs in
 // task input — not the upload URL, not a storage key, not the bare file ID.
 //
+// Put the URI into the model input field whose x-ui.widget is "upload" (or
+// inside the list for "multi-upload"); LoRA weights go into loras[].path. The
+// URI lasts one day. To keep a file longer, save it to the asset library with
+// SaveAsset (source AssetSourceUpload) or upload it with UploadAssetFile.
+//
 // Uploading is free; you pay for the task that consumes the file. A public
 // HTTPS URL can be passed in the input field directly and skips all of this.
 func (c *Client) Upload(ctx context.Context, data []byte, contentType string) (*UploadedFile, error) {
 	if len(data) == 0 {
 		return nil, errors.New("spicy: refusing to upload an empty file")
 	}
-	ticket, err := c.CreateUploadURL(ctx, contentType, int64(len(data)))
+	return c.upload(ctx, bytes.NewReader(data), int64(len(data)), contentType)
+}
+
+// upload takes a ticket for size bytes of contentType, streams them from body
+// and commits the result.
+func (c *Client) upload(ctx context.Context, body io.ReaderAt, size int64, contentType string) (*UploadedFile, error) {
+	ticket, err := c.CreateUploadURL(ctx, contentType, size)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > ticket.MaxBytes {
+	if size > ticket.MaxBytes {
 		return nil, fmt.Errorf(
 			"spicy: file is %d bytes, above this ticket's ceiling of %d",
-			len(data), ticket.MaxBytes,
+			size, ticket.MaxBytes,
 		)
 	}
-	if err := c.putUpload(ctx, ticket, data); err != nil {
+	if err := c.putUpload(ctx, ticket, body, size); err != nil {
 		return nil, err
 	}
 	return c.CommitUpload(ctx, ticket.FileID)
 }
 
-// UploadFile reads a local file and uploads it. An empty contentType is
-// inferred from the extension, which only works for the accepted media types.
+// UploadFile uploads a local file. An empty contentType is inferred from the
+// extension, which only works for the accepted media types; ".safetensors"
+// LoRA weights are sent as application/octet-stream.
+//
+// The file is streamed from disk rather than read into memory first, because
+// LoRA weights may be 2 GiB. A file that large can outlast DefaultUploadTimeout
+// on an ordinary uplink, so raise Options.UploadTimeout for big ones; the
+// ticket itself stays valid for two hours.
 func (c *Client) UploadFile(ctx context.Context, path, contentType string) (*UploadedFile, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("spicy: reading %s: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("spicy: reading %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("spicy: %s is not a regular file", path)
+	}
+	if info.Size() == 0 {
+		return nil, errors.New("spicy: refusing to upload an empty file")
 	}
 	if contentType == "" {
 		inferred, ok := uploadContentTypes[strings.ToLower(filepath.Ext(path))]
@@ -1528,11 +1575,11 @@ func (c *Client) UploadFile(ctx context.Context, path, contentType string) (*Upl
 		}
 		contentType = inferred
 	}
-	return c.Upload(ctx, data, contentType)
+	return c.upload(ctx, file, info.Size(), contentType)
 }
 
-// putUpload sends the bytes to object storage.
-func (c *Client) putUpload(ctx context.Context, ticket *UploadTicket, data []byte) error {
+// putUpload sends size bytes read from body to object storage.
+func (c *Client) putUpload(ctx context.Context, ticket *UploadTicket, body io.ReaderAt, size int64) error {
 	// Moving bytes uses its own upload timeout: 30 seconds is reasonable for a JSON call, but a
 	// 90 MiB video in 30 seconds demands 25 Mbit/s upstream, so on a real network we would cut
 	// ourselves off halfway through - and the error would look like the other side's fault.
@@ -1543,9 +1590,15 @@ func (c *Client) putUpload(ctx context.Context, ticket *UploadTicket, data []byt
 	if method == "" {
 		method = http.MethodPut
 	}
-	req, err := http.NewRequestWithContext(ctx, method, ticket.UploadURL, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, method, ticket.UploadURL, io.NewSectionReader(body, 0, size))
 	if err != nil {
 		return fmt.Errorf("spicy: building the upload request: %w", err)
+	}
+	// net/http only works out the length of a few in-memory body types by itself. Without this
+	// line a file body would go out chunked, which presigned PUTs refuse, so the length is stated.
+	req.ContentLength = size
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(io.NewSectionReader(body, 0, size)), nil
 	}
 
 	// Every header from the ticket is forwarded verbatim, except that net/http does not read two
@@ -1557,10 +1610,10 @@ func (c *Client) putUpload(ctx context.Context, ticket *UploadTicket, data []byt
 			// not forwarding but reconciliation: a mismatch means the ticket was issued for a
 			// different file, and uploading anyway would only hit 40003 at commit.
 			declared, parseErr := strconv.ParseInt(value, 10, 64)
-			if parseErr == nil && declared != int64(len(data)) {
+			if parseErr == nil && declared != size {
 				return fmt.Errorf(
 					"spicy: this ticket was issued for %d bytes but the file is %d",
-					declared, len(data),
+					declared, size,
 				)
 			}
 		case "Host":
@@ -2001,7 +2054,7 @@ func (c *Client) do(ctx context.Context, spec request) error {
 		if !parsed {
 			// Not an envelope - usually an HTML error page from an edge network. Only the HTTP
 			// status is available to go on, because there is no business code at all.
-			if spec.replayable && attempt < c.maxRetries && retryableHTTP[status] {
+			if spec.replayable && attempt < c.maxRetries && retryableHTTP[status] && c.canWaitFor(ctx, retryAfter) {
 				if waitErr := c.sleep(ctx, c.backoff(attempt, retryAfter)); waitErr != nil {
 					return waitErr
 				}
@@ -2015,7 +2068,9 @@ func (c *Client) do(ctx context.Context, spec request) error {
 		}
 
 		if status/100 != 2 || env.Code != CodeSuccess {
-			if spec.replayable && attempt < c.maxRetries && retryableCode[env.Code] {
+			// A server that asks for a longer wait than this call can give gets its answer handed
+			// back at once rather than slept through: see canWaitFor.
+			if spec.replayable && attempt < c.maxRetries && retryableCode[env.Code] && c.canWaitFor(ctx, retryAfter) {
 				if waitErr := c.sleep(ctx, c.backoff(attempt, retryAfter)); waitErr != nil {
 					return waitErr
 				}
@@ -2027,6 +2082,7 @@ func (c *Client) do(ctx context.Context, spec request) error {
 				Message:    env.Msg,
 				RequestID:  env.RequestID,
 				RetryAfter: retryAfter,
+				Reason:     failureReason(env.Data),
 			}
 		}
 
@@ -2119,6 +2175,53 @@ func (c *Client) backoff(attempt int, retryAfter time.Duration) time.Duration {
 	return c.jitter(delay)
 }
 
+// canWaitFor reports whether a retry that honours the server's Retry-After fits
+// this call.
+//
+// It does not when the server asks for more than maxRetryDelay, the longest
+// this client ever waits between attempts, or for more than the context has
+// left. Retrying early in the first case only asks a question the server has
+// already answered, and in the second the wait would end in the context's own
+// deadline error, which buries the server's code, Reason, RetryAfter and
+// request ID under a timeout that never happened. The asset library's daily
+// limit (429 with Retry-After until 00:00 UTC) is the case that made this
+// visible. Shorter waits are retried as before.
+func (c *Client) canWaitFor(ctx context.Context, retryAfter time.Duration) bool {
+	if retryAfter <= 0 {
+		return true
+	}
+	if retryAfter > maxRetryDelay {
+		return false
+	}
+	// The context's deadline is on the real clock, so it is compared with the real clock rather
+	// than with Options.Now.
+	if deadline, ok := ctx.Deadline(); ok && retryAfter > time.Until(deadline) {
+		return false
+	}
+	return true
+}
+
+// failureReason reads data.reason from a failure envelope. Any non-empty
+// string is kept verbatim, so a reason the server adds later still reaches the
+// caller; anything else - absent, null, empty or not a string - reads as no
+// reason at all.
+func failureReason(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var shape struct {
+		Reason json.RawMessage `json:"reason"`
+	}
+	if json.Unmarshal(data, &shape) != nil || len(shape.Reason) == 0 {
+		return ""
+	}
+	var reason string
+	if json.Unmarshal(shape.Reason, &reason) != nil {
+		return ""
+	}
+	return reason
+}
+
 // jitter spreads a delay over ±20 percent.
 func (c *Client) jitter(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * (0.8 + 0.4*c.rand()))
@@ -2201,6 +2304,7 @@ var acceptedUploadTypes = []string{
 	"application/vnd.apple.numbers",
 	"text/plain",
 	"text/markdown",
+	"application/octet-stream",
 }
 
 func isAcceptedUploadType(contentType string) bool {

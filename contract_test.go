@@ -45,6 +45,11 @@ func TestContractHasNotDrifted(t *testing.T) {
 		StateQueued, StateRunning, StateSucceeded, StateFailed, StateCanceled, StateExpired,
 	})
 	assertEnum(t, text, "    UploadURLRequest:", "contentType:", acceptedUploadTypes)
+	// The asset library's reasons, sorts and sources: a reason missing here is still passed through,
+	// but a sort or source missing here is refused locally before the server ever sees it.
+	assertEnum(t, text, "    ErrorEnvelope:", "reason:", assetErrorReasons)
+	assertEnum(t, text, "      operationId: listAssets", "name: sort,", assetSorts)
+	assertEnum(t, text, "    AssetCreateRequest:", "source:", assetSources)
 }
 
 // fetchLiveContract retrieves the published contract.

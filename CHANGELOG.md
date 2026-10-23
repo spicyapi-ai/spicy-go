@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.3.0 — 2026-10-23
+
+### Added
+
+- **The asset library.** Saved files are kept until they are deleted and are referenced as
+  `spicy://a/<id>` in any media field of model inputs sent with keys of the same workspace; an
+  upload's `spicy://` URI lasts one day. The key decides the library: a personal key reaches the
+  personal library, a team key that team's shared library, where the creator's current role decides
+  what may change.
+  - `SaveAsset(ctx, SaveAssetInput, idempotencyKey)` saves a task output (`TaskID` with `Key` or
+    `Index`), a committed upload (`FileID`) or a public URL (`URL`). It sends the required
+    `Idempotency-Key` itself when the argument is empty, the same one on every retry of the call;
+    pass your own to replay a save.
+  - `ListAssets` and `EachAsset` take `ListAssetsOptions`: `Kind`, `Source` (one or several), `Q`,
+    `Favorite` (a `*bool`, so `false` lists the assets that are not favorites), `CollectionID`,
+    `EntityID`, `Sort` (`AssetSortRecent`, `AssetSortOldest`, `AssetSortName`, `AssetSortSize`),
+    `Cursor` and `Limit`. `EachAsset` follows `NextCursor` and repeats the filters and sort on every
+    page; a cursor that comes back twice is refused instead of looping.
+  - `GetAsset`, `UpdateAsset` (`Name`, `Favorite` or both; only what you set is sent),
+    `DeleteAsset` and `GetAssetUsage`, which carries `Scope`.
+  - `UploadAssetFile(ctx, path, UploadAssetOptions)` uploads a local file and saves it in one call;
+    the name defaults to the file name, cut to 80 characters.
+  - `ListCharacters`, `EachCharacter` and `GetCharacter` read the library's characters (named,
+    ordered sets of images) with their images in order; `AssetCharacter.URIs` lists their
+    references. Characters are read-only through the API.
+  - Asset IDs are accepted as `ast_…` or as the `spicy://a/…` reference. Empty IDs, blank filters,
+    an unknown `Sort` and a save that mixes two sources fail before anything is sent.
+  - New types: `LibraryAsset` (a saved file; `Asset` remains one output of a task), `AssetList`,
+    `AssetCharacter`, `AssetCharacterList`, `DeletedAsset`, `AssetUsage`, `AssetPlan`,
+    `AssetScope`, `AssetLimits` and `AssetUsageTotals`.
+- **`APIError.Reason`**, read from a failure envelope's `data.reason`. The asset library uses
+  `asset_library_locked`, `asset_library_full`, `asset_file_too_large`, `asset_daily_limit`,
+  `asset_storage_full`, `asset_permission_denied`, `asset_workspace_forbidden` and
+  `asset_entity_name_taken`, exported as the `ReasonAsset*` constants with `AssetErrorReasons` and
+  `IsAssetErrorReason`; any other value is passed through unchanged. `APIError.Error` names the
+  reason when there is one.
+- **LoRA weight uploads.** `UploadFile` maps `.safetensors` to `application/octet-stream`, the
+  upload type for `loras[].path`, with its own 2 GiB ceiling.
+
+### Changed
+
+- `UploadFile` streams the file from disk with a declared length instead of reading it into memory
+  first, so a 2 GiB LoRA file does not need 2 GiB of memory. It also refuses an empty file and
+  anything that is not a regular file before asking for a ticket.
+- A retryable failure whose `Retry-After` is longer than this client waits between attempts (8
+  seconds), or than the context has left, is now returned at once with its `RetryAfter` and
+  `Reason`. It used to be retried early against a limit that had not moved, or end in the
+  context's own deadline error, which hid what the server said; the asset library's daily limit
+  (429 until 00:00 UTC) is the case that made this visible. Shorter waits are retried as before.
+- The pinned `contracts/openapi.yaml` matches the contract published on 2026-10-23, including the
+  asset routes and `POST /api/v1/files/import` (which this package does not wrap).
+  `TestContractHasNotDrifted` also pins the asset reasons, sorts and sources.
+
 ## v0.2.0 — 2026-10-05
 
 ### Module path
