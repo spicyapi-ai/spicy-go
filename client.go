@@ -65,7 +65,7 @@ import (
 // enforces that from inside the package: there is no build metadata to read
 // back, because a tagged module exposes its version only to the programs that
 // depend on it, and never to itself.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // UserAgent identifies this client on every API request.
 //
@@ -513,7 +513,25 @@ type TaskOutput struct {
 	// language details. Nil on every other task, and on transcription models
 	// that return plain text only.
 	Transcript *TaskTranscript `json:"transcript,omitempty"`
+	// Embeddings holds the vectors an embedding model returned. Nil on every
+	// other task.
+	Embeddings *TaskEmbeddings `json:"embeddings,omitempty"`
 	Assets     []Asset         `json:"assets,omitempty"`
+}
+
+// TaskEmbeddings is the result of an embedding task: one vector per input, in
+// input order. It is erased together with the rest of the output on the
+// prompt-retention schedule.
+type TaskEmbeddings struct {
+	// InputTokens is the measured input token count the charge is based on.
+	InputTokens int             `json:"inputTokens"`
+	Data        []TaskEmbedding `json:"data"`
+}
+
+// TaskEmbedding is the vector for the input at Index (zero-based).
+type TaskEmbedding struct {
+	Index     int       `json:"index"`
+	Embedding []float64 `json:"embedding"`
 }
 
 // TaskTranscript is a structured transcription. It is erased together with the
@@ -530,6 +548,9 @@ type TaskTranscript struct {
 	// DurationSeconds is the length of the transcribed audio.
 	DurationSeconds float64              `json:"durationSeconds,omitempty"`
 	Words           []TaskTranscriptWord `json:"words,omitempty"`
+	// Segments are timed phrases, with speaker labels when the model reports
+	// them. They are separate from the word-level timestamps in Words.
+	Segments []TaskTranscriptWord `json:"segments,omitempty"`
 	// Channels has one entry per audio channel when multichannel
 	// transcription was requested, and is empty otherwise.
 	Channels []TaskTranscriptChannel `json:"channels,omitempty"`

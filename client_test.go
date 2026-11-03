@@ -1117,6 +1117,7 @@ func TestTaskRecordDecodesTranscriptAndLayers(t *testing.T) {
 				"text":"left right","language":"en","languageCode":"eng",
 				"languageProbability":0.98,"durationSeconds":4.2,
 				"words":[{"text":"left","start":0.1,"end":0.4,"type":"word","speakerId":"speaker_0"}],
+				"segments":[{"text":"left right","start":0.1,"end":4.0,"speakerId":"speaker_0"}],
 				"channels":[{"index":0,"text":"left","words":[{"text":"left","start":0.1,"end":0.4}]},
 					{"index":1,"text":"right"}]}}}}`,
 		`{"code":200,"msg":"success","request_id":"r","data":{
@@ -1150,6 +1151,10 @@ func TestTaskRecordDecodesTranscriptAndLayers(t *testing.T) {
 	if len(transcript.Words) != 1 || transcript.Words[0].SpeakerID != "speaker_0" || transcript.Words[0].End != 0.4 {
 		t.Errorf("words = %+v", transcript.Words)
 	}
+	if len(transcript.Segments) != 1 || transcript.Segments[0].Text != "left right" ||
+		transcript.Segments[0].End != 4.0 || transcript.Segments[0].SpeakerID != "speaker_0" {
+		t.Errorf("segments = %+v", transcript.Segments)
+	}
 	if len(transcript.Channels) != 2 || transcript.Channels[1].Index != 1 || len(transcript.Channels[0].Words) != 1 {
 		t.Errorf("channels = %+v", transcript.Channels)
 	}
@@ -1181,8 +1186,40 @@ func TestTaskRecordDecodesTranscriptAndLayers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	if plain.Output.Transcript != nil || plain.Output.Assets[0].Layer != nil {
-		t.Errorf("an ordinary audio result grew a transcript or a layer: %+v", plain.Output)
+	if plain.Output.Transcript != nil || plain.Output.Embeddings != nil || plain.Output.Assets[0].Layer != nil {
+		t.Errorf("an ordinary audio result grew a transcript, embeddings or a layer: %+v", plain.Output)
+	}
+}
+
+// TestTaskRecordDecodesEmbeddings pins the embedding result. Before this field existed the vectors
+// decoded into nothing - encoding/json drops unknown keys silently - so a succeeded and charged
+// embedding task looked empty.
+func TestTaskRecordDecodesEmbeddings(t *testing.T) {
+	api := newRecordingAPI(t, `{"code":200,"msg":"success","request_id":"r","data":{
+		"taskId":"task_embedding","model":"m","state":"succeeded","cost":"0.000000012","settled":true,
+		"createdAt":"2026-11-03T10:00:00Z",
+		"output":{"embeddings":{"inputTokens":3,"data":[
+			{"index":0,"embedding":[-0.0704345703125,-0.40625,0.353759765625]},
+			{"index":1,"embedding":[0.5,0.25,-0.125]}]}}}}`)
+	client := api.client(t)
+
+	task, err := client.GetTask(context.Background(), "task_embedding")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	embeddings := task.Output.Embeddings
+	if embeddings == nil {
+		t.Fatal("the embedding result was dropped")
+	}
+	if embeddings.InputTokens != 3 || len(embeddings.Data) != 2 {
+		t.Fatalf("embeddings = %+v", embeddings)
+	}
+	if embeddings.Data[1].Index != 1 || len(embeddings.Data[1].Embedding) != 3 ||
+		embeddings.Data[0].Embedding[0] != -0.0704345703125 {
+		t.Errorf("vectors = %+v", embeddings.Data)
+	}
+	if len(task.Output.Assets) != 0 || task.Output.Transcript != nil {
+		t.Errorf("an embedding result grew assets or a transcript: %+v", task.Output)
 	}
 }
 

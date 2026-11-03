@@ -18,7 +18,7 @@ speak the OpenAI, Anthropic and Gemini wire formats.
 go get github.com/spicyapi-ai/spicy-go
 ```
 
-This README describes v0.3.0; see the [changelog](CHANGELOG.md) for what changed.
+This README describes v0.4.0; see the [changelog](CHANGELOG.md) for what changed.
 
 Requires Go 1.23+. **Standard library only** — this package goes into your dependency graph, and
 every module it adds is one more thing for you to audit.
@@ -69,6 +69,11 @@ for _, asset := range final.ReadyAssets() {
 
 Build `Input` from that model's own `inputSchema` — every model has different fields, and
 `ListModels` returns them.
+
+Not every result is a file. Speech-to-text models answer in `Output.Text`, with `Output.Transcript`
+(words, timed `Segments`, language) when the model reports more; embedding models answer in
+`Output.Embeddings`, one vector per input in input order. Image-to-3D and text-to-3D models return
+one asset with role `mesh`, a `.glb` file.
 
 ## Skipping the first poll
 
@@ -336,6 +341,9 @@ this package still helps there: chat models that read images, video or audio tak
 URI from `UploadFile` in an `image_url`, `video_url` or `audio_url` message part. Which parts a
 model accepts is in its input schema; see
 [sending media to a text model](https://docs.spicyapi.ai/docs/text-and-streaming#media-input).
+The same goes for the OpenAI-compatible `POST /v1/embeddings` and `POST /v1/audio/speech` routes and
+the realtime WebSocket at `wss://api.spicyapi.ai/v1/realtime`; see the
+[realtime guide](https://docs.spicyapi.ai/docs/realtime-audio).
 
 **Client-side applications.** Never ship this key inside a binary you distribute. Call from your
 server.
