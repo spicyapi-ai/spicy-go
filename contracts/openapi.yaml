@@ -2117,6 +2117,10 @@ components:
         words:
           type: array
           items: { $ref: '#/components/schemas/TaskTranscriptWord' }
+        segments:
+          type: array
+          description: Timed phrases, including speaker labels when available; separate from word-level timestamps.
+          items: { $ref: '#/components/schemas/TaskTranscriptWord' }
         channels:
           type: array
           description: Present when multichannel transcription was requested; one entry per audio channel.
@@ -2162,7 +2166,7 @@ components:
             Video translation endpoints return the dubbed clip (`video`); endpoints that also produce a subtitle file of
             the translated speech add it as a second asset (`subtitle`, `mime` `application/x-subrip`, an `.srt` file),
             kept for the same retention period as the video.
-            Image to 3D endpoints return one `mesh` asset: a binary glTF file (`mime` `model/gltf-binary`, a `.glb`
+            Image to 3D and text to 3D endpoints return one `mesh` asset: a binary glTF file (`mime` `model/gltf-binary`, a `.glb`
             file with its textures embedded). The download is served as `application/octet-stream`.
             Vector endpoints (text to SVG, image to SVG) return `image` assets with `mime` `image/svg+xml` (an `.svg` file built
             from paths). Scripts, event handlers, external references and embedded bitmaps are removed or rejected before
@@ -2466,7 +2470,7 @@ components:
             same video dubbed into another language; some models also re-sync the lips or add a subtitle file as a
             `subtitle` asset), `layer-decomposition` (returns a base
             image plus transparent layers, see `TaskOutputAsset.layer`), `image-to-3d` (returns one textured 3D mesh as a
-            binary glTF `.glb` file, asset role `mesh`), `speech-to-text`, `realtime`, `realtime-transcription`, `audio-to-audio` (returns one
+            binary glTF `.glb` file, asset role `mesh`), `text-to-3d` (the same output, generated from a text prompt), `speech-to-text`, `realtime`, `realtime-transcription`, `audio-to-audio` (returns one
             processed audio track, for example a speech recording with the noise removed), `chat`. New values
             appear as models are added, so treat the set as open.
         async: { type: boolean }
@@ -2671,8 +2675,8 @@ components:
             cacheWrite: { type: string }
             audio:
               type: object
-              description: Audio token rates; when present, the parent input/cachedInput/output rates apply to text only.
-              required: [input, cachedInput, output]
+              description: Audio token rates; when present, the parent rates apply to text only. File transcription has only audio input; unsupported cached input and audio output are omitted.
+              required: [input]
               properties:
                 input: { type: string }
                 cachedInput: { type: string }
