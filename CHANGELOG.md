@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.0 — 2026-11-03
+
+### Added
+
+- `TaskOutput.Embeddings` (`TaskEmbeddings`, `TaskEmbedding`): the vectors an embedding model
+  returns, with the measured `InputTokens`. Until now they were decoded into nothing, so a
+  succeeded embedding task looked empty.
+- `TaskTranscript.Segments`: timed phrases, with speaker labels when the model reports them,
+  separate from the word-level timestamps in `Words`.
+
+### Changed
+
+- The pinned contract follows the published one: OpenAI-compatible speech, embeddings and realtime
+  routes, `mesh`, `subtitle` and `segment` asset roles, SVG images and model `outputSpecs`.
+
 ## v0.3.0 — 2026-10-23
 
 ### Added
